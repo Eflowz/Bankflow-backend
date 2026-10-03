@@ -1,0 +1,6 @@
+.env
+diagnose-db.mjs
+smole-test.mjs
+test.sh
+node_modules/
+dist/

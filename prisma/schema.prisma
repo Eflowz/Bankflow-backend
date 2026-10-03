@@ -1,0 +1,248 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────
+
+enum Role {
+  CUSTOMER
+  ADMIN
+  OPERATIONS
+  AUDITOR
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum AccountType {
+  SAVINGS
+  CURRENT
+  WALLET
+}
+
+enum AccountStatus {
+  ACTIVE
+  FROZEN
+  CLOSED
+}
+
+enum TransactionType {
+  CREDIT // money in
+  DEBIT // money out
+  TRANSFER // outbound transfer (a special DEBIT)
+}
+
+enum TransactionStatus {
+  PENDING
+  SUCCESSFUL
+  FAILED
+  REVERSED
+}
+
+enum TransferStatus {
+  PENDING
+  SUCCESSFUL
+  FAILED
+}
+
+// ─────────────────────────────────────────────────────────────
+// MODELS
+// ─────────────────────────────────────────────────────────────
+
+model User {
+  id           String     @id @default(uuid())
+  email        String     @unique
+  phone        String     @unique
+  passwordHash String     @map("password_hash")
+  firstName    String     @map("first_name")
+  lastName     String     @map("last_name")
+  role         Role       @default(CUSTOMER)
+  status       UserStatus @default(ACTIVE)
+
+  // Security
+  failedLoginAttempts Int       @default(0) @map("failed_login_attempts")
+  lockedUntil         DateTime? @map("locked_until")
+  lastLoginAt         DateTime? @map("last_login_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  accounts      Account[]
+  beneficiaries Beneficiary[]
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]     @relation("ActorAuditLogs")
+
+  @@map("users")
+}
+
+model Account {
+  id            String        @id @default(uuid())
+  userId        String        @map("user_id")
+  accountNumber String        @unique @map("account_number")
+  accountName   String        @map("account_name")
+  type          AccountType   @default(SAVINGS)
+  status        AccountStatus @default(ACTIVE)
+
+  // Money stored in minor units (kobo)
+  balanceMinor BigInt @default(0) @map("balance_minor")
+
+  currency String @default("NGN")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user         User          @relation(fields: [userId], references: [id])
+  transactions Transaction[] @relation("AccountTransactions")
+
+  // Transfer relationships
+  outboundTransfers Transfer[] @relation("OutboundTransfers")
+  inboundTransfers  Transfer[] @relation("InboundTransfers")
+
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Transaction {
+  id        String            @id @default(uuid())
+  accountId String            @map("account_id")
+  type      TransactionType
+  status    TransactionStatus @default(PENDING)
+
+  // MONEY: signed amount in minor units. Negative = debit, positive = credit.
+  amountMinor BigInt @map("amount_minor")
+  currency    String @default("NGN")
+
+  // Running balance after this transaction (also minor units)
+  balanceAfterMinor BigInt @map("balance_after_minor")
+
+  narration String?
+
+  // Link to transfer (if this transaction was part of a transfer)
+  transferId String? @map("transfer_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  account  Account   @relation("AccountTransactions", fields: [accountId], references: [id])
+  transfer Transfer? @relation(fields: [transferId], references: [id])
+
+  @@index([accountId, createdAt])
+  @@index([transferId])
+  @@map("transactions")
+}
+
+model Transfer {
+  id String @id @default(uuid())
+
+  fromAccountId String @map("from_account_id")
+  toAccountId   String @map("to_account_id")
+
+  // MONEY: always positive, in minor units
+  amountMinor BigInt @map("amount_minor")
+  currency    String @default("NGN")
+
+  narration String?
+  status    TransferStatus @default(PENDING)
+
+  // Idempotency — ties this transfer back to the client's request key
+  idempotencyKey String @unique @map("idempotency_key")
+
+  // Failure reason if status = FAILED
+  failureReason String? @map("failure_reason")
+
+  createdAt   DateTime  @default(now()) @map("created_at")
+  completedAt DateTime? @map("completed_at")
+
+  fromAccount  Account       @relation("OutboundTransfers", fields: [fromAccountId], references: [id])
+  toAccount    Account       @relation("InboundTransfers", fields: [toAccountId], references: [id])
+  transactions Transaction[]
+
+  @@index([fromAccountId, createdAt])
+  @@index([toAccountId, createdAt])
+  @@map("transfers")
+}
+
+model Beneficiary {
+  id            String  @id @default(uuid())
+  userId        String  @map("user_id")
+  accountNumber String  @map("account_number")
+  accountName   String  @map("account_name")
+  bankName      String  @map("bank_name")
+  nickname      String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, accountNumber, bankName])
+  @@index([userId])
+  @@map("beneficiaries")
+}
+
+// Tracks every idempotency key we've seen, with the response we returned.
+// If a client retries with the same key, we return the SAME response
+// instead of executing the operation twice.
+model IdempotencyKey {
+  id           String   @id @default(uuid())
+  key          String   @unique
+  userId       String   @map("user_id")
+  endpoint     String
+  requestHash  String   @map("request_hash") // sha256 of the body — detects key reuse with different payload
+  statusCode   Int      @map("status_code")
+  responseBody Json     @map("response_body")
+  createdAt    DateTime @default(now()) @map("created_at")
+  expiresAt    DateTime @map("expires_at")
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("idempotency_keys")
+}
+
+// Refresh tokens stored hashed. One row per issued token.
+// Rotation: on refresh, mark the old one revoked and issue a new row.
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  // Where it was issued from (for audit)
+  userAgent String? @map("user_agent")
+  ipAddress String? @map("ip_address")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  actorId   String?  @map("actor_id") // null if system action
+  action    String // e.g. "transfer.created", "user.login.failed"
+  entity    String // e.g. "Transfer", "User"
+  entityId  String?  @map("entity_id")
+  metadata  Json?
+  ipAddress String?  @map("ip_address")
+  userAgent String?  @map("user_agent")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  actor User? @relation("ActorAuditLogs", fields: [actorId], references: [id])
+
+  @@index([actorId, createdAt])
+  @@index([entity, entityId])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}
