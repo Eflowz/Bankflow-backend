@@ -16,7 +16,7 @@ export const CreateBeneficiarySchema = z.object({
 export const UpdateBeneficiarySchema = z.object({
   accountName: z.string().min(1).max(100).trim().optional(),
   bankName: z.string().min(1).max(100).trim().optional(),
-  nickname: z.string().min(1).max(50).trim().optional(),
+  nickname: z.string().max(50).trim().nullable().optional(),
 });
 
 export type CreateBeneficiaryInput = z.infer<typeof CreateBeneficiarySchema>;
